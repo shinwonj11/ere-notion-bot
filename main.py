@@ -5,14 +5,19 @@ import re
 import os
 from datetime import datetime, timedelta
 
-# --- [1. 보안 및 접속 설정] ---
+# --- [1. 설정 정보] ---
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 DATABASE_ID = os.environ.get("DATABASE_ID")
 
+# [핵심] 한국어 설정을 추가하여 "한국에서 접속한 크롬 브라우저"처럼 완벽하게 속입니다.
 HEADERS_WEB = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://ere.snu.ac.kr/" # 어디서 왔는지 알려주어 봇 차단을 더 강력히 방지합니다
+    "Referer": "https://ere.snu.ac.kr/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "keep-alive"
 }
+
 HEADERS_NOTION = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Content-Type": "application/json",
@@ -28,8 +33,6 @@ ERE_BOARDS = [
     {"name": "ERE-자유게시판", "url": "https://ere.snu.ac.kr/bbs/board.php?bo_table=sub5_6"},
 ]
 
-# --- [2. 핵심 함수들] ---
-
 def get_existing_urls():
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     try:
@@ -40,16 +43,16 @@ def get_existing_urls():
     except: pass
     return []
 
-def get_full_date(post_url):
+def get_full_date(session, post_url):
     try:
-        res = requests.get(post_url, headers=HEADERS_WEB, timeout=10)
+        # [핵심] 세션 유지하며 접속
+        res = session.get(post_url, headers=HEADERS_WEB, timeout=10)
         res.encoding = 'utf-8'
         soup = BeautifulSoup(res.text, 'html.parser')
         text = soup.get_text()
-        # YY-MM-DD HH:MM 패턴
+        
         match = re.search(r'(\d{2}-\d{2}-\d{2})\s+\d{2}:\d{2}', text)
         if match: return "20" + match.group(1)
-        # YYYY-MM-DD 패턴
         match = re.search(r'(\d{4}-\d{2}-\d{2})', text)
         if match: return match.group(1)
     except: pass
@@ -72,26 +75,31 @@ def send_to_notion(item):
 def crawl_and_run():
     print("📡 서버 시작... 노션 데이터 조회 중")
     existing_links = get_existing_urls()
-    limit_date = datetime.now() - timedelta(days=180) # 6개월 필터
+    limit_date = datetime.now() - timedelta(days=365) # 1년으로 넉넉하게
+    
+    # [핵심] 세션(Session)을 사용하여 쿠키와 연결 정보를 유지합니다.
+    session = requests.Session()
     
     total_added = 0
     for board in ERE_BOARDS:
         print(f"\n🔍 {board['name']} 분석 중...")
         try:
-            res = requests.get(board['url'], headers=HEADERS_WEB, timeout=10)
+            res = session.get(board['url'], headers=HEADERS_WEB, timeout=15)
             res.encoding = 'utf-8'
             soup = BeautifulSoup(res.text, 'html.parser')
             
-            # [수정] tbody를 제거하고 더 넓은 범위의 tr을 찾습니다. 
-            # 그누보드는 보통 .tbl_head01 클래스를 사용합니다.
+            # [진단] 도대체 무슨 페이지가 뜨는지 제목을 확인합니다.
+            page_title = soup.title.get_text(strip=True) if soup.title else "제목 없음"
+            print(f"   📄 접속된 페이지 제목: {page_title}")
+            
+            # [진단] 만약 제목이 'Security'나 '차단' 관련이면 여기서 바로 알 수 있습니다.
+            if "Security" in page_title or "차단" in page_title or "Access Denied" in res.text:
+                print("   🚨 [경고] 깃허브 서버의 접속이 차단되었습니다.")
+                continue
+
             rows = soup.select('.tbl_head01 tr') or soup.select('table tr')
             print(f"   📊 검색된 줄 수: {len(rows)}개")
             
-            # 만약 여전히 0개라면 서버가 차단한 것이므로 로그를 남깁니다.
-            if len(rows) <= 1: # 제목줄만 있거나 아예 없는 경우
-                print(f"   ⚠️ 주의: 게시글을 찾지 못했습니다. (응답 코드: {res.status_code})")
-                continue
-
             for row in rows:
                 subject_td = row.select_one('.td_subject')
                 if not subject_td: continue
@@ -102,7 +110,7 @@ def crawl_and_run():
                     if link in existing_links: continue
 
                     title = target_link.get_text(strip=True)
-                    full_date_str = get_full_date(link)
+                    full_date_str = get_full_date(session, link)
                     
                     if full_date_str:
                         post_date = datetime.strptime(full_date_str, '%Y-%m-%d')
@@ -110,8 +118,6 @@ def crawl_and_run():
                             print(f"   ✅ [전송] {full_date_str} | {title[:15]}...")
                             send_to_notion({"title": title, "link": link, "date": full_date_str, "site": board['name']})
                             total_added += 1
-                        else:
-                            print(f"   ⏩ [스킵-과거] {full_date_str} | {title[:15]}...")
                     time.sleep(0.3)
         except Exception as e:
             print(f"❌ 에러: {e}")
